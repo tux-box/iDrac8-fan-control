@@ -1,85 +1,77 @@
 import os
+import subprocess
 import time
-from pysnmp.hlapi import *
+from dotenv import load_dotenv
 
-# Environment variables
+load_dotenv()
+
 IDRAC_HOST = os.getenv("IDRAC_HOST")
 IDRAC_USER = os.getenv("IDRAC_USER")
-IDRAC_PASS = os.getenv("IDRAC_PASS")  # not used in SNMPv2, placeholder for SNMPv3
-COMMUNITY = os.getenv("SNMP_COMMUNITY", "public")
-MODE = os.getenv("MODE", "continuous")  # continuous or oneshot
+IDRAC_PASS = os.getenv("IDRAC_PASS")
+
+MODE = os.getenv("MODE", "continuous")
 INTERVAL = int(os.getenv("INTERVAL", "30"))
-SAFE_TEMP = int(os.getenv("SAFE_TEMP", "75"))
+SAFE_TEMP = int(os.getenv("SAFE_TEMP", "65"))
+CRIT_TEMP = int(os.getenv("CRIT_TEMP", "75"))
 
-# Example OIDs (these may need tweaking for iDRAC8 MIBs)
-TEMP_OID = "1.3.6.1.4.1.674.10892.5.4.600.12.1.8.1"   # system ambient temp
-FAN_OID  = "1.3.6.1.4.1.674.10892.5.4.600.50.1.5.1"   # fan speed control
+def run_ipmi(cmd):
+    base = ["ipmitool", "-I", "lanplus", "-H", IDRAC_HOST, "-U", IDRAC_USER, "-P", IDRAC_PASS]
+    result = subprocess.run(base + cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print("IPMI error:", result.stderr.strip())
+        return None
+    return result.stdout.strip()
 
-def get_snmp(oid):
-    for (errorIndication, errorStatus, errorIndex, varBinds) in getCmd(
-        SnmpEngine(),
-        CommunityData(COMMUNITY, mpModel=0),
-        UdpTransportTarget((IDRAC_HOST, 161)),
-        ContextData(),
-        ObjectType(ObjectIdentity(oid))
-    ):
-        if errorIndication:
-            print("SNMP error:", errorIndication)
-            return None
-        elif errorStatus:
-            print("%s at %s" % (errorStatus.prettyPrint(),
-                                errorIndex and varBinds[int(errorIndex)-1][0] or "?"))
-            return None
-        else:
-            for varBind in varBinds:
-                return int(varBind[1])
+def get_max_temp():
+    output = run_ipmi(["sdr"])
+    if not output:
+        return None
+    temps = []
+    for line in output.splitlines():
+        if "degrees C" in line:
+            try:
+                temps.append(int(line.split()[-2]))
+            except ValueError:
+                continue
+    return max(temps) if temps else None
 
-def set_snmp(oid, value):
-    errorIndication, errorStatus, errorIndex, varBinds = next(
-        setCmd(
-            SnmpEngine(),
-            CommunityData(COMMUNITY, mpModel=0),
-            UdpTransportTarget((IDRAC_HOST, 161)),
-            ContextData(),
-            ObjectType(ObjectIdentity(oid), Integer(value))
-        )
-    )
-    if errorIndication:
-        print("SNMP SET error:", errorIndication)
-    elif errorStatus:
-        print("%s at %s" % (errorStatus.prettyPrint(),
-                            errorIndex and varBinds[int(errorIndex)-1][0] or "?"))
-    else:
-        print(f"Fan speed set to {value}%")
+def set_fan_manual():
+    run_ipmi(["raw", "0x30", "0x30", "0x01", "0x00"])
 
-def control_loop():
+def set_fan_auto():
+    run_ipmi(["raw", "0x30", "0x30", "0x01", "0x01"])
+
+def set_fan_speed(percent):
+    # Convert 0-100% to 0x00-0xFF
+    value = hex(int(percent * 255 / 100))
+    run_ipmi(["raw", "0x30", "0x30", "0x02", "0xff", value])
+
+def main_loop():
+    print("🚀 Starting iDRAC Fan Controller (IPMI mode)...")
+    set_fan_manual()
+
     while True:
-        temp = get_snmp(TEMP_OID)
-        if temp is None:
-            print("Failed to read temperature.")
+        max_temp = get_max_temp()
+        if max_temp is None:
+            print("Failed to read temperature. Retrying...")
             time.sleep(INTERVAL)
             continue
 
-        print(f"Current temperature: {temp}°C")
+        print(f"🌡 Max temperature: {max_temp}°C")
 
-        if temp > SAFE_TEMP:
-            print("Temperature exceeded safe limit! Reverting control to iDRAC.")
-            set_snmp(FAN_OID, 0)  # 0 means auto-control on some iDRACs
+        if max_temp >= CRIT_TEMP:
+            print("🔥 CRITICAL TEMP! Reverting to auto control.")
+            set_fan_auto()
             break
-
-        # Simple linear fan curve
-        if temp < 30:
-            fanspeed = 20
-        elif temp < 40:
-            fanspeed = 30
-        elif temp < 50:
-            fanspeed = 50
-        elif temp < 60:
-            fanspeed = 70
+        elif max_temp >= SAFE_TEMP:
+            print("⚠ Safe limit reached, setting fans to 100%")
+            set_fan_speed(100)
         else:
-            fanspeed = 90
-
-        set_snmp(FAN_OID, fanspeed)
+            # Linear fan curve
+            fan_speed = int(20 + (max_temp / SAFE_TEMP) * 70)
+            fan_speed = min(max(fan_speed, 20), 90)
+            print(f"🌀 Setting fan speed to {fan_speed}%")
+            set_fan_speed(fan_speed)
 
         if MODE == "oneshot":
             break
@@ -87,4 +79,8 @@ def control_loop():
         time.sleep(INTERVAL)
 
 if __name__ == "__main__":
-    control_loop()
+    try:
+        main_loop()
+    except KeyboardInterrupt:
+        print("🛑 Exiting, reverting to auto control...")
+        set_fan_auto()
