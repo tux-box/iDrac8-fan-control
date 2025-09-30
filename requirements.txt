@@ -1,0 +1,2 @@
+pysnmp==5.0.26
+python-dotenv==1.0.1
