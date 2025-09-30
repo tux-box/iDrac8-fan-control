@@ -1,8 +1,12 @@
 services:
-  idrac-fan-control:
+  idrac-fancontrol:
     build: .
-    container_name: idrac-fan-control
+    container_name: idrac-fancontrol
     env_file:
       - .env
     restart: unless-stopped
-    network_mode: "bridge"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
