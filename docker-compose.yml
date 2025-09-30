@@ -1,0 +1,8 @@
+services:
+  idrac-fan-control:
+    build: .
+    container_name: idrac-fan-control
+    env_file:
+      - .env
+    restart: unless-stopped
+    network_mode: "bridge"
